@@ -1,0 +1,192 @@
+import { invoke } from "@tauri-apps/api/core";
+import "./styles.css";
+
+type Profile = {
+  id: string;
+  name: string;
+  directory: string;
+  apiKey: string;
+  baseUrl: string;
+};
+
+type AppState = {
+  profiles: Profile[];
+  activeId: string | null;
+};
+
+const emptyProfile = (): Profile => ({
+  id: "",
+  name: "",
+  directory: "C:\\Users\\Admin\\.codex",
+  apiKey: "",
+  baseUrl: "",
+});
+
+let state: AppState = { profiles: [], activeId: null };
+let editing = emptyProfile();
+let busy = false;
+let toastTimer = 0;
+
+const app = document.querySelector<HTMLDivElement>("#app")!;
+
+function escapeHtml(value: string): string {
+  const element = document.createElement("div");
+  element.textContent = value;
+  return element.innerHTML;
+}
+
+function escapeAttribute(value: string): string {
+  return escapeHtml(value).replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+}
+
+function maskedKey(value: string): string {
+  return value.length < 12 ? "********" : `${value.slice(0, 7)}********${value.slice(-4)}`;
+}
+
+function render(): void {
+  app.innerHTML = `
+    <main class="shell">
+      <header>
+        <div><p class="eyebrow">CODEX</p><h1>账号配置</h1></div>
+        <button class="secondary" id="new-profile" ${busy ? "disabled" : ""}>新建配置</button>
+      </header>
+      <section class="workspace">
+        <aside aria-label="已保存配置">
+          <div class="section-heading"><h2>已保存</h2><span>${state.profiles.length}</span></div>
+          <div class="profile-list">
+            ${state.profiles.length === 0 ? '<p class="empty">还没有配置</p>' : ""}
+            ${state.profiles.map((profile) => `
+              <article class="profile ${profile.id === state.activeId ? "active" : ""}">
+                <div class="profile-title">
+                  <strong>${escapeHtml(profile.name)}</strong>
+                  ${profile.id === state.activeId ? "<span>当前</span>" : ""}
+                </div>
+                <p>${escapeHtml(profile.baseUrl)}</p>
+                <p class="key">${escapeHtml(maskedKey(profile.apiKey))}</p>
+                <div class="profile-actions">
+                  <button class="primary apply" data-id="${escapeAttribute(profile.id)}" ${busy || profile.id === state.activeId ? "disabled" : ""}>切换</button>
+                  <button class="text edit" data-id="${escapeAttribute(profile.id)}" ${busy ? "disabled" : ""}>编辑</button>
+                  <button class="text danger delete" data-id="${escapeAttribute(profile.id)}" ${busy ? "disabled" : ""}>删除</button>
+                </div>
+              </article>`).join("")}
+          </div>
+        </aside>
+        <form id="profile-form">
+          <div class="section-heading form-heading">
+            <div><p class="eyebrow">${editing.id ? "EDIT" : "NEW"}</p><h2>${editing.id ? "编辑配置" : "新建配置"}</h2></div>
+          </div>
+          <label>配置名称
+            <input name="name" required autocomplete="off" value="${escapeAttribute(editing.name)}" placeholder="例如：工作账号" />
+          </label>
+          <label>Codex 配置目录
+            <input name="directory" required autocomplete="off" value="${escapeAttribute(editing.directory)}" placeholder="C:\\Users\\Admin\\.codex" />
+            <small>目录内必须包含 auth.json 和 config.toml</small>
+          </label>
+          <label>OPENAI_API_KEY
+            <div class="secret-input">
+              <input name="apiKey" type="password" required autocomplete="off" value="${escapeAttribute(editing.apiKey)}" placeholder="sk-..." />
+              <label class="show-key"><input type="checkbox" id="show-key" /> 显示</label>
+            </div>
+          </label>
+          <label>base_url
+            <input name="baseUrl" type="url" required autocomplete="off" value="${escapeAttribute(editing.baseUrl)}" placeholder="https://api.example.com" />
+          </label>
+          <div class="form-actions">
+            <button class="primary" type="submit" ${busy ? "disabled" : ""}>${busy ? "处理中..." : "保存配置"}</button>
+            ${editing.id ? '<button class="secondary" type="button" id="cancel-edit">取消</button>' : ""}
+          </div>
+        </form>
+      </section>
+      <div id="toast" role="status" aria-live="polite"></div>
+    </main>`;
+  bindEvents();
+}
+
+function formProfile(): Profile {
+  const data = new FormData(document.querySelector<HTMLFormElement>("#profile-form")!);
+  return {
+    id: editing.id,
+    name: String(data.get("name") ?? ""),
+    directory: String(data.get("directory") ?? ""),
+    apiKey: String(data.get("apiKey") ?? ""),
+    baseUrl: String(data.get("baseUrl") ?? ""),
+  };
+}
+
+function showToast(message: string, error = false): void {
+  window.clearTimeout(toastTimer);
+  const toast = document.querySelector<HTMLDivElement>("#toast")!;
+  toast.textContent = message;
+  toast.className = error ? "visible error" : "visible";
+  toastTimer = window.setTimeout(() => toast.className = "", 3000);
+}
+
+async function run(action: () => Promise<AppState>, success: string): Promise<void> {
+  busy = true;
+  render();
+  try {
+    state = await action();
+    editing = emptyProfile();
+    busy = false;
+    render();
+    showToast(success);
+  } catch (error) {
+    busy = false;
+    render();
+    showToast(String(error), true);
+  }
+}
+
+function bindEvents(): void {
+  document.querySelector("#new-profile")?.addEventListener("click", () => {
+    editing = emptyProfile();
+    render();
+  });
+  document.querySelector("#cancel-edit")?.addEventListener("click", () => {
+    editing = emptyProfile();
+    render();
+  });
+  document.querySelector<HTMLInputElement>("#show-key")?.addEventListener("change", (event) => {
+    document.querySelector<HTMLInputElement>('input[name="apiKey"]')!.type =
+      (event.target as HTMLInputElement).checked ? "text" : "password";
+  });
+  document.querySelector("#profile-form")?.addEventListener("submit", (event) => {
+    event.preventDefault();
+    const profile = formProfile();
+    void run(() => invoke("save_profile", { profile }), "配置已保存");
+  });
+  document.querySelectorAll<HTMLButtonElement>(".apply").forEach((button) => {
+    button.addEventListener("click", () => {
+      void run(() => invoke("apply_profile", { id: button.dataset.id }), "切换成功，重启 Codex 后生效");
+    });
+  });
+  document.querySelectorAll<HTMLButtonElement>(".edit").forEach((button) => {
+    button.addEventListener("click", () => {
+      const profile = state.profiles.find((item) => item.id === button.dataset.id);
+      if (profile) {
+        editing = { ...profile };
+        render();
+      }
+    });
+  });
+  document.querySelectorAll<HTMLButtonElement>(".delete").forEach((button) => {
+    button.addEventListener("click", () => {
+      const profile = state.profiles.find((item) => item.id === button.dataset.id);
+      if (profile && window.confirm(`删除配置“${profile.name}”？`)) {
+        void run(() => invoke("delete_profile", { id: profile.id }), "配置已删除");
+      }
+    });
+  });
+}
+
+async function start(): Promise<void> {
+  render();
+  try {
+    state = await invoke("get_state");
+    render();
+  } catch (error) {
+    showToast(String(error), true);
+  }
+}
+
+void start();
