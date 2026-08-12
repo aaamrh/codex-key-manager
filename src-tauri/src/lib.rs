@@ -224,14 +224,26 @@ fn apply_profile(id: String) -> Result<AppState, String> {
     Ok(state_from(profiles))
 }
 
+#[tauri::command]
+fn exit_app(app: tauri::AppHandle) {
+    app.exit(0);
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                let _ = window.minimize();
+            }
+        })
         .invoke_handler(tauri::generate_handler![
             get_state,
             save_profile,
             delete_profile,
-            apply_profile
+            apply_profile,
+            exit_app
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

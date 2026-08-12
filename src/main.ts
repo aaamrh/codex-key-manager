@@ -53,7 +53,10 @@ function render(): void {
     <main class="shell">
       <header>
         <div><p class="eyebrow">CODEX</p><h1>账号配置</h1></div>
-        <button class="secondary" id="new-profile" ${busy ? "disabled" : ""}>新建配置</button>
+        <div class="header-actions">
+          <button class="secondary" id="new-profile" ${busy ? "disabled" : ""}>新建配置</button>
+          <button class="text danger" id="exit-app" ${busy ? "disabled" : ""}>退出</button>
+        </div>
       </header>
       <section class="workspace">
         <aside aria-label="已保存配置">
@@ -151,6 +154,9 @@ function bindEvents(): void {
   document.querySelector("#new-profile")?.addEventListener("click", () => {
     editing = emptyProfile();
     render();
+  });
+  document.querySelector("#exit-app")?.addEventListener("click", () => {
+    if (window.confirm("退出 Codex Key Manager？")) void invoke("exit_app");
   });
   document.querySelector("#cancel-edit")?.addEventListener("click", () => {
     editing = emptyProfile();

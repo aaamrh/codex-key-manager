@@ -1,6 +1,6 @@
 [package]
 name = "codex-key-manager"
-version = "0.1.1"
+version = "0.1.2"
 description = "Switch Codex API accounts quickly"
 authors = ["aaamrh"]
 edition = "2021"
