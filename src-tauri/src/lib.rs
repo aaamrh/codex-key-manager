@@ -17,10 +17,36 @@ use uuid::Uuid;
 
 const APP_DIR: &str = "codex-key-manager";
 const PROFILES_FILE: &str = "profiles.json";
+const DATA_VERSION: u32 = 2;
+const APPLICATION_ID: &str = "codex";
 
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct Profile {
+    id: String,
+    name: String,
+    api_key: String,
+    base_url: String,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ApplicationConfig {
+    id: String,
+    directory: String,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct StoredData {
+    version: u32,
+    application: ApplicationConfig,
+    profiles: Vec<Profile>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LegacyProfile {
     id: String,
     name: String,
     directory: String,
@@ -28,11 +54,26 @@ struct Profile {
     base_url: String,
 }
 
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ImportFile {
+    Current(StoredData),
+    Legacy(Vec<LegacyProfile>),
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct AppState {
+    directory: String,
     profiles: Vec<Profile>,
     active_id: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ImportPreview {
+    directory: Option<String>,
+    profile_count: usize,
 }
 
 fn profiles_path() -> Result<PathBuf, String> {
@@ -42,20 +83,98 @@ fn profiles_path() -> Result<PathBuf, String> {
     Ok(app_data.join(APP_DIR).join(PROFILES_FILE))
 }
 
-fn load_profiles_file() -> Result<Vec<Profile>, String> {
+fn default_directory() -> String {
+    std::env::var_os("USERPROFILE")
+        .map(PathBuf::from)
+        .unwrap_or_default()
+        .join(".codex")
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn default_data() -> StoredData {
+    StoredData {
+        version: DATA_VERSION,
+        application: ApplicationConfig {
+            id: APPLICATION_ID.to_string(),
+            directory: default_directory(),
+        },
+        profiles: Vec::new(),
+    }
+}
+
+fn comparable_directory(directory: &str) -> String {
+    directory
+        .trim()
+        .replace('/', "\\")
+        .trim_end_matches('\\')
+        .to_lowercase()
+}
+
+fn data_from_import(file: ImportFile) -> Result<StoredData, String> {
+    match file {
+        ImportFile::Current(data) => {
+            if data.version != DATA_VERSION {
+                return Err(format!("不支持的数据版本：{}", data.version));
+            }
+            if data.application.id != APPLICATION_ID {
+                return Err("导入文件不是 Codex 配置".to_string());
+            }
+            Ok(data)
+        }
+        ImportFile::Legacy(profiles) => {
+            let mut directories = profiles
+                .iter()
+                .map(|profile| profile.directory.trim())
+                .filter(|directory| !directory.is_empty());
+            let directory = directories
+                .next()
+                .map(str::to_string)
+                .unwrap_or_else(default_directory);
+            let comparable = comparable_directory(&directory);
+            if directories.any(|candidate| comparable_directory(candidate) != comparable) {
+                return Err("旧版导入文件包含多个 Codex 目录，无法合并为一个应用设置".to_string());
+            }
+            Ok(StoredData {
+                version: DATA_VERSION,
+                application: ApplicationConfig {
+                    id: APPLICATION_ID.to_string(),
+                    directory,
+                },
+                profiles: profiles
+                    .into_iter()
+                    .map(|profile| Profile {
+                        id: profile.id,
+                        name: profile.name,
+                        api_key: profile.api_key,
+                        base_url: profile.base_url,
+                    })
+                    .collect(),
+            })
+        }
+    }
+}
+
+fn parse_data(content: &str) -> Result<StoredData, String> {
+    let file: ImportFile =
+        serde_json::from_str(content).map_err(|error| format!("配置文件格式错误：{error}"))?;
+    data_from_import(file)
+}
+
+fn load_data_file() -> Result<StoredData, String> {
     let path = profiles_path()?;
     if !path.exists() {
-        return Ok(Vec::new());
+        return Ok(default_data());
     }
     let content =
         fs::read_to_string(&path).map_err(|error| format!("读取配置列表失败：{error}"))?;
-    serde_json::from_str(&content).map_err(|error| format!("解析配置列表失败：{error}"))
+    parse_data(&content).map_err(|error| format!("解析配置列表失败：{error}"))
 }
 
-fn save_profiles_file(profiles: &[Profile]) -> Result<(), String> {
+fn save_data_file(data: &StoredData) -> Result<(), String> {
     let path = profiles_path()?;
-    let content = serde_json::to_string_pretty(profiles)
-        .map_err(|error| format!("序列化配置失败：{error}"))?;
+    let content =
+        serde_json::to_string_pretty(data).map_err(|error| format!("序列化配置失败：{error}"))?;
     write_file_atomic(&path, &format!("{content}\n"))
 }
 
@@ -74,17 +193,8 @@ fn write_file_atomic(path: &Path, content: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_profile(profile: &Profile) -> Result<(), String> {
-    if profile.name.trim().is_empty() {
-        return Err("请输入配置名称".to_string());
-    }
-    if profile.api_key.trim().is_empty() {
-        return Err("请输入 OPENAI_API_KEY".to_string());
-    }
-    if !(profile.base_url.starts_with("http://") || profile.base_url.starts_with("https://")) {
-        return Err("base_url 必须以 http:// 或 https:// 开头".to_string());
-    }
-    let directory = Path::new(profile.directory.trim());
+fn validate_directory(directory: &str) -> Result<(), String> {
+    let directory = Path::new(directory.trim());
     if !directory.is_dir() {
         return Err("配置目录不存在".to_string());
     }
@@ -97,10 +207,22 @@ fn validate_profile(profile: &Profile) -> Result<(), String> {
     Ok(())
 }
 
+fn validate_profile(profile: &Profile) -> Result<(), String> {
+    if profile.name.trim().is_empty() {
+        return Err("请输入配置名称".to_string());
+    }
+    if profile.api_key.trim().is_empty() {
+        return Err("请输入 OPENAI_API_KEY".to_string());
+    }
+    if !(profile.base_url.starts_with("http://") || profile.base_url.starts_with("https://")) {
+        return Err("base_url 必须以 http:// 或 https:// 开头".to_string());
+    }
+    Ok(())
+}
+
 fn normalize_profile(mut profile: Profile) -> Result<Profile, String> {
     profile.id = profile.id.trim().to_string();
     profile.name = profile.name.trim().to_string();
-    profile.directory = profile.directory.trim().to_string();
     profile.api_key = profile.api_key.trim().to_string();
     profile.base_url = profile.base_url.trim().trim_end_matches('/').to_string();
     if profile.id.is_empty() {
@@ -199,88 +321,126 @@ fn apply_values(directory: &Path, api_key: &str, base_url: &str) -> Result<(), S
     Ok(())
 }
 
-fn state_from(profiles: Vec<Profile>) -> AppState {
-    let active_id = profiles.iter().find_map(|profile| {
-        current_values(&profile.directory)
+fn state_from(data: StoredData) -> AppState {
+    let active_id =
+        current_values(&data.application.directory)
             .ok()
-            .filter(|(api_key, base_url)| {
-                api_key == &profile.api_key && base_url == &profile.base_url
-            })
-            .map(|_| profile.id.clone())
-    });
+            .and_then(|(api_key, base_url)| {
+                data.profiles
+                    .iter()
+                    .find(|profile| profile.api_key == api_key && profile.base_url == base_url)
+                    .map(|profile| profile.id.clone())
+            });
     AppState {
-        profiles,
+        directory: data.application.directory,
+        profiles: data.profiles,
         active_id,
     }
 }
 
 #[tauri::command]
 fn get_state() -> Result<AppState, String> {
-    load_profiles_file().map(state_from)
+    load_data_file().map(state_from)
+}
+
+#[tauri::command]
+fn save_application(directory: String) -> Result<AppState, String> {
+    let directory = directory.trim().to_string();
+    validate_directory(&directory)?;
+    let mut data = load_data_file()?;
+    data.application.directory = directory;
+    save_data_file(&data)?;
+    Ok(state_from(data))
 }
 
 #[tauri::command]
 fn save_profile(mut profile: Profile) -> Result<AppState, String> {
-    let mut profiles = load_profiles_file()?;
+    let mut data = load_data_file()?;
+    validate_directory(&data.application.directory)?;
     if profile.id.is_empty() {
         profile = normalize_profile(profile)?;
-        profiles.push(profile);
-    } else if let Some(saved) = profiles.iter_mut().find(|saved| saved.id == profile.id) {
+        data.profiles.push(profile);
+    } else if let Some(saved) = data
+        .profiles
+        .iter_mut()
+        .find(|saved| saved.id == profile.id)
+    {
         profile = normalize_profile(profile)?;
         *saved = profile;
     } else {
         return Err("要编辑的配置不存在".to_string());
     }
-    save_profiles_file(&profiles)?;
-    Ok(state_from(profiles))
+    save_data_file(&data)?;
+    Ok(state_from(data))
 }
 
 #[tauri::command]
 fn delete_profile(id: String) -> Result<AppState, String> {
-    let mut profiles = load_profiles_file()?;
-    let old_len = profiles.len();
-    profiles.retain(|profile| profile.id != id);
-    if profiles.len() == old_len {
+    let mut data = load_data_file()?;
+    let old_len = data.profiles.len();
+    data.profiles.retain(|profile| profile.id != id);
+    if data.profiles.len() == old_len {
         return Err("要删除的配置不存在".to_string());
     }
-    save_profiles_file(&profiles)?;
-    Ok(state_from(profiles))
+    save_data_file(&data)?;
+    Ok(state_from(data))
 }
 
 #[tauri::command]
 fn apply_profile(id: String) -> Result<AppState, String> {
-    let profiles = load_profiles_file()?;
-    let profile = profiles
+    let data = load_data_file()?;
+    validate_directory(&data.application.directory)?;
+    let profile = data
+        .profiles
         .iter()
         .find(|profile| profile.id == id)
         .ok_or_else(|| "要切换的配置不存在".to_string())?;
     validate_profile(profile)?;
 
     apply_values(
-        Path::new(&profile.directory),
+        Path::new(&data.application.directory),
         &profile.api_key,
         &profile.base_url,
     )?;
-    Ok(state_from(profiles))
+    Ok(state_from(data))
 }
 
 #[tauri::command]
-fn import_profiles(path: String) -> Result<AppState, String> {
+fn preview_import(path: String) -> Result<ImportPreview, String> {
     let content =
         fs::read_to_string(&path).map_err(|error| format!("读取导入文件失败：{error}"))?;
-    let imported: Vec<Profile> =
-        serde_json::from_str(&content).map_err(|error| format!("导入文件格式错误：{error}"))?;
-    if imported.is_empty() {
+    let imported = parse_data(&content).map_err(|error| format!("导入文件格式错误：{error}"))?;
+    if imported.profiles.is_empty() {
         return Err("导入文件中没有配置".to_string());
     }
+    Ok(ImportPreview {
+        directory: Some(imported.application.directory),
+        profile_count: imported.profiles.len(),
+    })
+}
 
-    let imported = imported
+#[tauri::command]
+fn import_profiles(path: String, import_directory: bool) -> Result<AppState, String> {
+    let content =
+        fs::read_to_string(&path).map_err(|error| format!("读取导入文件失败：{error}"))?;
+    let imported = parse_data(&content).map_err(|error| format!("导入文件格式错误：{error}"))?;
+    if imported.profiles.is_empty() {
+        return Err("导入文件中没有配置".to_string());
+    }
+    let profiles = imported
+        .profiles
         .into_iter()
         .map(normalize_profile)
         .collect::<Result<Vec<_>, _>>()?;
-    let profiles = merge_profiles(load_profiles_file()?, imported);
-    save_profiles_file(&profiles)?;
-    Ok(state_from(profiles))
+    let mut data = load_data_file()?;
+    if import_directory {
+        let directory = imported.application.directory.trim().to_string();
+        validate_directory(&directory)?;
+        data.application.directory = directory;
+    }
+    data.profiles = merge_profiles(data.profiles, profiles);
+    save_data_file(&data)?;
+    Ok(state_from(data))
 }
 
 #[tauri::command]
@@ -288,7 +448,7 @@ async fn export_profiles(app: tauri::AppHandle) -> Result<bool, String> {
     let Some(file) = app
         .dialog()
         .file()
-        .set_file_name("codex-key-manager-profiles.json")
+        .set_file_name("codex-key-manager-backup.json")
         .add_filter("JSON 配置", &["json"])
         .blocking_save_file()
     else {
@@ -297,8 +457,8 @@ async fn export_profiles(app: tauri::AppHandle) -> Result<bool, String> {
     let path = file
         .into_path()
         .map_err(|error| format!("导出路径无效：{error}"))?;
-    let profiles = load_profiles_file()?;
-    let content = serde_json::to_string_pretty(&profiles)
+    let data = load_data_file()?;
+    let content = serde_json::to_string_pretty(&data)
         .map_err(|error| format!("生成导出文件失败：{error}"))?;
     write_file_atomic(&path, &format!("{content}\n"))?;
     Ok(true)
@@ -363,9 +523,11 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             get_state,
+            save_application,
             save_profile,
             delete_profile,
             apply_profile,
+            preview_import,
             import_profiles,
             export_profiles,
             exit_app
@@ -377,7 +539,8 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_values, current_values, merge_profiles, updated_auth, updated_config, Profile,
+        apply_values, current_values, merge_profiles, parse_data, updated_auth, updated_config,
+        Profile, DATA_VERSION,
     };
     use std::fs;
 
@@ -433,7 +596,6 @@ mod tests {
         let profile = |id: &str, name: &str| Profile {
             id: id.to_string(),
             name: name.to_string(),
-            directory: "C:\\Users\\Admin\\.codex".to_string(),
             api_key: "key".to_string(),
             base_url: "https://example.com".to_string(),
         };
@@ -446,5 +608,54 @@ mod tests {
         assert_eq!(merged[0].name, "new");
         assert_eq!(merged[1].name, "kept");
         assert_eq!(merged[2].name, "added");
+    }
+
+    #[test]
+    fn migrates_legacy_profile_array() {
+        let data = parse_data(
+            r#"[{
+                "id":"one",
+                "name":"First",
+                "directory":"C:\\Users\\Admin\\.codex",
+                "apiKey":"key",
+                "baseUrl":"https://example.com"
+            }]"#,
+        )
+        .unwrap();
+
+        assert_eq!(data.version, DATA_VERSION);
+        assert_eq!(data.application.directory, r"C:\Users\Admin\.codex");
+        assert_eq!(data.profiles.len(), 1);
+        assert_eq!(data.profiles[0].name, "First");
+    }
+
+    #[test]
+    fn rejects_legacy_profiles_with_different_directories() {
+        let result = parse_data(
+            r#"[
+              {"id":"one","name":"One","directory":"C:\\one","apiKey":"a","baseUrl":"https://one.example"},
+              {"id":"two","name":"Two","directory":"C:\\two","apiKey":"b","baseUrl":"https://two.example"}
+            ]"#,
+        );
+        let error = match result {
+            Ok(_) => panic!("不同目录应拒绝迁移"),
+            Err(error) => error,
+        };
+
+        assert!(error.contains("多个 Codex 目录"));
+    }
+
+    #[test]
+    fn accepts_equivalent_legacy_windows_directories() {
+        let data = parse_data(
+            r#"[
+              {"id":"one","name":"One","directory":"C:\\Users\\Admin\\.codex","apiKey":"a","baseUrl":"https://one.example"},
+              {"id":"two","name":"Two","directory":"C:/Users/Admin/.codex/","apiKey":"b","baseUrl":"https://two.example"}
+            ]"#,
+        )
+        .unwrap();
+
+        assert_eq!(data.application.directory, r"C:\Users\Admin\.codex");
+        assert_eq!(data.profiles.len(), 2);
     }
 }

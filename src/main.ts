@@ -5,26 +5,31 @@ import "./styles.css";
 type Profile = {
   id: string;
   name: string;
-  directory: string;
   apiKey: string;
   baseUrl: string;
 };
 
 type AppState = {
+  directory: string;
   profiles: Profile[];
   activeId: string | null;
+};
+
+type ImportPreview = {
+  directory: string | null;
+  profileCount: number;
 };
 
 const emptyProfile = (): Profile => ({
   id: "",
   name: "",
-  directory: "C:\\Users\\Admin\\.codex",
   apiKey: "",
   baseUrl: "",
 });
 
-let state: AppState = { profiles: [], activeId: null };
+let state: AppState = { directory: "", profiles: [], activeId: null };
 let editing = emptyProfile();
+let editingApplication = false;
 let busy = false;
 let toastTimer = 0;
 
@@ -61,6 +66,13 @@ function render(): void {
           <button class="text danger" id="exit-app" ${busy ? "disabled" : ""}>退出</button>
         </div>
       </header>
+      <section class="application-bar">
+        <div>
+          <p class="eyebrow">APPLICATION</p>
+          <div class="application-title"><strong>Codex</strong><span>${escapeHtml(state.directory || "尚未设置目录")}</span></div>
+        </div>
+        <button class="secondary" id="edit-application" ${busy ? "disabled" : ""}>修改目录</button>
+      </section>
       <section class="workspace">
         <aside aria-label="已保存配置">
           <div class="section-heading"><h2>已保存</h2><span>${state.profiles.length}</span></div>
@@ -82,16 +94,26 @@ function render(): void {
               </article>`).join("")}
           </div>
         </aside>
+        ${editingApplication ? `
+        <form id="application-form">
+          <div class="section-heading form-heading">
+            <div><p class="eyebrow">APPLICATION</p><h2>Codex 应用设置</h2></div>
+          </div>
+          <label>Codex 配置目录
+            <input name="directory" required autocomplete="off" value="${escapeAttribute(state.directory)}" placeholder="C:\\Users\\Admin\\.codex" />
+            <small>只设置一次，所有账号都切换这个目录中的 auth.json 和 config.toml</small>
+          </label>
+          <div class="form-actions">
+            <button class="primary" type="submit" ${busy ? "disabled" : ""}>${busy ? "处理中..." : "保存应用设置"}</button>
+            <button class="secondary" type="button" id="cancel-application">取消</button>
+          </div>
+        </form>` : `
         <form id="profile-form">
           <div class="section-heading form-heading">
             <div><p class="eyebrow">${editing.id ? "EDIT" : "NEW"}</p><h2>${editing.id ? "编辑配置" : "新建配置"}</h2></div>
           </div>
           <label>配置名称
             <input name="name" required autocomplete="off" value="${escapeAttribute(editing.name)}" placeholder="例如：工作账号" />
-          </label>
-          <label>Codex 配置目录
-            <input name="directory" required autocomplete="off" value="${escapeAttribute(editing.directory)}" placeholder="C:\\Users\\Admin\\.codex" />
-            <small>目录内必须包含 auth.json 和 config.toml</small>
           </label>
           <label>OPENAI_API_KEY
             <div class="secret-input">
@@ -106,7 +128,7 @@ function render(): void {
             <button class="primary" type="submit" ${busy ? "disabled" : ""}>${busy ? "处理中..." : "保存配置"}</button>
             ${editing.id ? '<button class="secondary" type="button" id="cancel-edit">取消</button>' : ""}
           </div>
-        </form>
+        </form>`}
       </section>
       <div id="toast" role="status" aria-live="polite"></div>
     </main>`;
@@ -118,7 +140,6 @@ function formProfile(): Profile {
   return {
     id: editing.id,
     name: String(data.get("name") ?? ""),
-    directory: String(data.get("directory") ?? ""),
     apiKey: String(data.get("apiKey") ?? ""),
     baseUrl: String(data.get("baseUrl") ?? ""),
   };
@@ -136,7 +157,7 @@ async function run(
   action: () => Promise<AppState>,
   success: string,
   selectAfter: (nextState: AppState) => Profile | undefined,
-): Promise<void> {
+): Promise<boolean> {
   busy = true;
   render();
   try {
@@ -146,10 +167,12 @@ async function run(
     busy = false;
     render();
     showToast(success);
+    return true;
   } catch (error) {
     busy = false;
     render();
     showToast(String(error), true);
+    return false;
   }
 }
 
@@ -161,8 +184,16 @@ async function importProfiles(): Promise<void> {
       filters: [{ name: "JSON 配置", extensions: ["json"] }],
     });
     if (path) {
+      const preview = await invoke<ImportPreview>("preview_import", { path });
+      if (!window.confirm(`导入文件包含 ${preview.profileCount} 个账号，继续？`)) return;
+      let importDirectory = false;
+      if (preview.directory && preview.directory !== state.directory) {
+        importDirectory = window.confirm(
+          `导入文件包含应用目录：\n${preview.directory}\n\n是否同时覆盖当前 Codex 目录？\n选择“取消”将保留本机目录。`,
+        );
+      }
       await run(
-        () => invoke("import_profiles", { path }),
+        () => invoke("import_profiles", { path, importDirectory }),
         "配置已导入",
         firstAvailableProfile,
       );
@@ -189,6 +220,29 @@ async function exportProfiles(): Promise<void> {
 }
 
 function bindEvents(): void {
+  document.querySelector("#edit-application")?.addEventListener("click", () => {
+    editingApplication = true;
+    render();
+  });
+  document.querySelector("#cancel-application")?.addEventListener("click", () => {
+    editingApplication = false;
+    render();
+  });
+  document.querySelector("#application-form")?.addEventListener("submit", (event) => {
+    event.preventDefault();
+    const data = new FormData(event.currentTarget as HTMLFormElement);
+    const directory = String(data.get("directory") ?? "");
+    void run(
+      () => invoke("save_application", { directory }),
+      "Codex 目录已保存",
+      firstAvailableProfile,
+    ).then((saved) => {
+      if (saved) {
+        editingApplication = false;
+        render();
+      }
+    });
+  });
   document.querySelector("#import-profiles")?.addEventListener("click", () => {
     void importProfiles();
   });
@@ -196,6 +250,7 @@ function bindEvents(): void {
     void exportProfiles();
   });
   document.querySelector("#new-profile")?.addEventListener("click", () => {
+    editingApplication = false;
     editing = emptyProfile();
     render();
   });
@@ -235,6 +290,7 @@ function bindEvents(): void {
     button.addEventListener("click", () => {
       const profile = state.profiles.find((item) => item.id === button.dataset.id);
       if (profile) {
+        editingApplication = false;
         editing = { ...profile };
         render();
       }
@@ -256,6 +312,7 @@ function bindEvents(): void {
     const selectCard = () => {
       const profile = state.profiles.find((item) => item.id === card.dataset.profileId);
       if (profile) {
+        editingApplication = false;
         editing = { ...profile };
         render();
       }

@@ -15,6 +15,9 @@ button:disabled { cursor: default; opacity: .5; }
 .shell { max-width: 1120px; margin: 0 auto; padding: 30px; }
 header { display: flex; align-items: end; justify-content: space-between; margin-bottom: 24px; }
 .header-actions { display: flex; align-items: center; gap: 8px; }
+.application-bar { min-height: 68px; display: flex; align-items: center; justify-content: space-between; gap: 20px; margin-bottom: 12px; padding: 13px 16px; border: 1px solid #d7dadd; border-radius: 6px; background: #fff; }
+.application-title { display: flex; align-items: baseline; gap: 14px; }
+.application-title span { overflow: hidden; color: #626970; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
 h1, h2, p { margin: 0; }
 h1 { font-size: 30px; line-height: 1.2; }
 h2 { font-size: 17px; }
@@ -60,6 +63,9 @@ small { color: #7a8087; font-size: 11px; font-weight: 400; }
 @media (max-width: 760px) {
   .shell { padding: 18px; }
   .workspace { grid-template-columns: 1fr; }
+  header { align-items: start; gap: 14px; }
+  .header-actions { flex-wrap: wrap; justify-content: end; }
+  .application-title { display: grid; gap: 3px; }
   aside { border-right: 0; border-bottom: 1px solid #dfe2e4; }
   .profile-list { max-height: 260px; }
   form { padding: 24px 22px; }
