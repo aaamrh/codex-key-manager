@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { open } from "@tauri-apps/plugin-dialog";
 import "./styles.css";
 
 type Profile = {
@@ -54,6 +55,8 @@ function render(): void {
       <header>
         <div><p class="eyebrow">CODEX</p><h1>账号配置</h1></div>
         <div class="header-actions">
+          <button class="secondary" id="import-profiles" ${busy ? "disabled" : ""}>导入</button>
+          <button class="secondary" id="export-profiles" ${busy || state.profiles.length === 0 ? "disabled" : ""}>导出</button>
           <button class="secondary" id="new-profile" ${busy ? "disabled" : ""}>新建配置</button>
           <button class="text danger" id="exit-app" ${busy ? "disabled" : ""}>退出</button>
         </div>
@@ -150,7 +153,48 @@ async function run(
   }
 }
 
+async function importProfiles(): Promise<void> {
+  try {
+    const path = await open({
+      multiple: false,
+      directory: false,
+      filters: [{ name: "JSON 配置", extensions: ["json"] }],
+    });
+    if (path) {
+      await run(
+        () => invoke("import_profiles", { path }),
+        "配置已导入",
+        firstAvailableProfile,
+      );
+    }
+  } catch (error) {
+    showToast(String(error), true);
+  }
+}
+
+async function exportProfiles(): Promise<void> {
+  if (!window.confirm("导出文件包含明文 OPENAI_API_KEY，继续？")) return;
+  try {
+    busy = true;
+    render();
+    const exported = await invoke<boolean>("export_profiles");
+    busy = false;
+    render();
+    if (exported) showToast("配置已导出");
+  } catch (error) {
+    busy = false;
+    render();
+    showToast(String(error), true);
+  }
+}
+
 function bindEvents(): void {
+  document.querySelector("#import-profiles")?.addEventListener("click", () => {
+    void importProfiles();
+  });
+  document.querySelector("#export-profiles")?.addEventListener("click", () => {
+    void exportProfiles();
+  });
   document.querySelector("#new-profile")?.addEventListener("click", () => {
     editing = emptyProfile();
     render();

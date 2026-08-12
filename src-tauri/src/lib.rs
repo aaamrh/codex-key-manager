@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use std::{
     fs,
+    io::Write,
     path::{Path, PathBuf},
 };
 use tauri::{
@@ -9,6 +10,8 @@ use tauri::{
     tray::{MouseButton, TrayIconBuilder, TrayIconEvent},
     Manager,
 };
+use tauri_plugin_dialog::DialogExt;
+use tempfile::NamedTempFile;
 use toml_edit::{value, DocumentMut};
 use uuid::Uuid;
 
@@ -51,11 +54,24 @@ fn load_profiles_file() -> Result<Vec<Profile>, String> {
 
 fn save_profiles_file(profiles: &[Profile]) -> Result<(), String> {
     let path = profiles_path()?;
-    let parent = path.parent().ok_or_else(|| "配置目录无效".to_string())?;
-    fs::create_dir_all(parent).map_err(|error| format!("创建配置目录失败：{error}"))?;
     let content = serde_json::to_string_pretty(profiles)
         .map_err(|error| format!("序列化配置失败：{error}"))?;
-    fs::write(path, format!("{content}\n")).map_err(|error| format!("保存配置失败：{error}"))
+    write_file_atomic(&path, &format!("{content}\n"))
+}
+
+fn write_file_atomic(path: &Path, content: &str) -> Result<(), String> {
+    let parent = path.parent().ok_or_else(|| "文件目录无效".to_string())?;
+    fs::create_dir_all(parent).map_err(|error| format!("创建文件目录失败：{error}"))?;
+    let mut temp =
+        NamedTempFile::new_in(parent).map_err(|error| format!("创建临时文件失败：{error}"))?;
+    temp.write_all(content.as_bytes())
+        .map_err(|error| format!("写入临时文件失败：{error}"))?;
+    temp.as_file()
+        .sync_all()
+        .map_err(|error| format!("同步临时文件失败：{error}"))?;
+    temp.persist(path)
+        .map_err(|error| format!("替换文件失败：{}", error.error))?;
+    Ok(())
 }
 
 fn validate_profile(profile: &Profile) -> Result<(), String> {
@@ -79,6 +95,30 @@ fn validate_profile(profile: &Profile) -> Result<(), String> {
         return Err("配置目录中缺少 config.toml".to_string());
     }
     Ok(())
+}
+
+fn normalize_profile(mut profile: Profile) -> Result<Profile, String> {
+    profile.id = profile.id.trim().to_string();
+    profile.name = profile.name.trim().to_string();
+    profile.directory = profile.directory.trim().to_string();
+    profile.api_key = profile.api_key.trim().to_string();
+    profile.base_url = profile.base_url.trim().trim_end_matches('/').to_string();
+    if profile.id.is_empty() {
+        profile.id = Uuid::new_v4().to_string();
+    }
+    validate_profile(&profile)?;
+    Ok(profile)
+}
+
+fn merge_profiles(mut existing: Vec<Profile>, imported: Vec<Profile>) -> Vec<Profile> {
+    for profile in imported {
+        if let Some(saved) = existing.iter_mut().find(|saved| saved.id == profile.id) {
+            *saved = profile;
+        } else {
+            existing.push(profile);
+        }
+    }
+    existing
 }
 
 fn updated_auth(content: &str, api_key: &str) -> Result<String, String> {
@@ -181,17 +221,12 @@ fn get_state() -> Result<AppState, String> {
 
 #[tauri::command]
 fn save_profile(mut profile: Profile) -> Result<AppState, String> {
-    profile.name = profile.name.trim().to_string();
-    profile.directory = profile.directory.trim().to_string();
-    profile.api_key = profile.api_key.trim().to_string();
-    profile.base_url = profile.base_url.trim().trim_end_matches('/').to_string();
-    validate_profile(&profile)?;
-
     let mut profiles = load_profiles_file()?;
     if profile.id.is_empty() {
-        profile.id = Uuid::new_v4().to_string();
+        profile = normalize_profile(profile)?;
         profiles.push(profile);
     } else if let Some(saved) = profiles.iter_mut().find(|saved| saved.id == profile.id) {
+        profile = normalize_profile(profile)?;
         *saved = profile;
     } else {
         return Err("要编辑的配置不存在".to_string());
@@ -230,6 +265,46 @@ fn apply_profile(id: String) -> Result<AppState, String> {
 }
 
 #[tauri::command]
+fn import_profiles(path: String) -> Result<AppState, String> {
+    let content =
+        fs::read_to_string(&path).map_err(|error| format!("读取导入文件失败：{error}"))?;
+    let imported: Vec<Profile> =
+        serde_json::from_str(&content).map_err(|error| format!("导入文件格式错误：{error}"))?;
+    if imported.is_empty() {
+        return Err("导入文件中没有配置".to_string());
+    }
+
+    let imported = imported
+        .into_iter()
+        .map(normalize_profile)
+        .collect::<Result<Vec<_>, _>>()?;
+    let profiles = merge_profiles(load_profiles_file()?, imported);
+    save_profiles_file(&profiles)?;
+    Ok(state_from(profiles))
+}
+
+#[tauri::command]
+async fn export_profiles(app: tauri::AppHandle) -> Result<bool, String> {
+    let Some(file) = app
+        .dialog()
+        .file()
+        .set_file_name("codex-key-manager-profiles.json")
+        .add_filter("JSON 配置", &["json"])
+        .blocking_save_file()
+    else {
+        return Ok(false);
+    };
+    let path = file
+        .into_path()
+        .map_err(|error| format!("导出路径无效：{error}"))?;
+    let profiles = load_profiles_file()?;
+    let content = serde_json::to_string_pretty(&profiles)
+        .map_err(|error| format!("生成导出文件失败：{error}"))?;
+    write_file_atomic(&path, &format!("{content}\n"))?;
+    Ok(true)
+}
+
+#[tauri::command]
 fn exit_app(app: tauri::AppHandle) {
     app.exit(0);
 }
@@ -245,6 +320,7 @@ fn show_main_window(app: &tauri::AppHandle) {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let open = MenuItem::with_id(app, "open", "打开", true, None::<&str>)?;
             let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
@@ -290,6 +366,8 @@ pub fn run() {
             save_profile,
             delete_profile,
             apply_profile,
+            import_profiles,
+            export_profiles,
             exit_app
         ])
         .run(tauri::generate_context!())
@@ -298,8 +376,10 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_values, current_values, updated_auth, updated_config};
-    use std::{fs, path::PathBuf};
+    use super::{
+        apply_values, current_values, merge_profiles, updated_auth, updated_config, Profile,
+    };
+    use std::fs;
 
     #[test]
     fn updates_only_requested_values() {
@@ -345,6 +425,26 @@ mod tests {
             .unwrap()
             .contains("wire_api = \"responses\""));
 
-        fs::remove_dir_all(PathBuf::from(directory)).unwrap();
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn merges_imported_profiles_by_id() {
+        let profile = |id: &str, name: &str| Profile {
+            id: id.to_string(),
+            name: name.to_string(),
+            directory: "C:\\Users\\Admin\\.codex".to_string(),
+            api_key: "key".to_string(),
+            base_url: "https://example.com".to_string(),
+        };
+        let merged = merge_profiles(
+            vec![profile("same", "old"), profile("kept", "kept")],
+            vec![profile("same", "new"), profile("added", "added")],
+        );
+
+        assert_eq!(merged.len(), 3);
+        assert_eq!(merged[0].name, "new");
+        assert_eq!(merged[1].name, "kept");
+        assert_eq!(merged[2].name, "added");
     }
 }
