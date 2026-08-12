@@ -17,8 +17,9 @@ use uuid::Uuid;
 
 const APP_DIR: &str = "codex-key-manager";
 const PROFILES_FILE: &str = "profiles.json";
-const DATA_VERSION: u32 = 2;
-const APPLICATION_ID: &str = "codex";
+const DATA_VERSION: u32 = 3;
+const CODEX_KIND: &str = "codex";
+const LEGACY_CODEX_ID: &str = "codex-legacy-v1-v2";
 
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -33,14 +34,31 @@ struct Profile {
 #[serde(rename_all = "camelCase")]
 struct ApplicationConfig {
     id: String,
+    name: String,
+    kind: String,
     directory: String,
+    profiles: Vec<Profile>,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct StoredData {
     version: u32,
-    application: ApplicationConfig,
+    applications: Vec<ApplicationConfig>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct V2ApplicationConfig {
+    id: String,
+    directory: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct V2StoredData {
+    version: u32,
+    application: V2ApplicationConfig,
     profiles: Vec<Profile>,
 }
 
@@ -58,12 +76,22 @@ struct LegacyProfile {
 #[serde(untagged)]
 enum ImportFile {
     Current(StoredData),
+    V2(V2StoredData),
     Legacy(Vec<LegacyProfile>),
 }
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct AppState {
+    applications: Vec<ApplicationState>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ApplicationState {
+    id: String,
+    name: String,
+    kind: String,
     directory: String,
     profiles: Vec<Profile>,
     active_id: Option<String>,
@@ -72,8 +100,9 @@ struct AppState {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ImportPreview {
-    directory: Option<String>,
+    application_count: usize,
     profile_count: usize,
+    has_existing_directories: bool,
 }
 
 fn profiles_path() -> Result<PathBuf, String> {
@@ -95,11 +124,13 @@ fn default_directory() -> String {
 fn default_data() -> StoredData {
     StoredData {
         version: DATA_VERSION,
-        application: ApplicationConfig {
-            id: APPLICATION_ID.to_string(),
+        applications: vec![ApplicationConfig {
+            id: Uuid::new_v4().to_string(),
+            name: "Codex".to_string(),
+            kind: CODEX_KIND.to_string(),
             directory: default_directory(),
-        },
-        profiles: Vec::new(),
+            profiles: Vec::new(),
+        }],
     }
 }
 
@@ -117,10 +148,22 @@ fn data_from_import(file: ImportFile) -> Result<StoredData, String> {
             if data.version != DATA_VERSION {
                 return Err(format!("不支持的数据版本：{}", data.version));
             }
-            if data.application.id != APPLICATION_ID {
-                return Err("导入文件不是 Codex 配置".to_string());
-            }
             Ok(data)
+        }
+        ImportFile::V2(data) => {
+            if data.version != 2 || data.application.id != CODEX_KIND {
+                return Err("导入文件不是受支持的配置".to_string());
+            }
+            Ok(StoredData {
+                version: DATA_VERSION,
+                applications: vec![ApplicationConfig {
+                    id: LEGACY_CODEX_ID.to_string(),
+                    name: "Codex".to_string(),
+                    kind: CODEX_KIND.to_string(),
+                    directory: data.application.directory,
+                    profiles: data.profiles,
+                }],
+            })
         }
         ImportFile::Legacy(profiles) => {
             let mut directories = profiles
@@ -137,19 +180,21 @@ fn data_from_import(file: ImportFile) -> Result<StoredData, String> {
             }
             Ok(StoredData {
                 version: DATA_VERSION,
-                application: ApplicationConfig {
-                    id: APPLICATION_ID.to_string(),
+                applications: vec![ApplicationConfig {
+                    id: LEGACY_CODEX_ID.to_string(),
+                    name: "Codex".to_string(),
+                    kind: CODEX_KIND.to_string(),
                     directory,
-                },
-                profiles: profiles
-                    .into_iter()
-                    .map(|profile| Profile {
-                        id: profile.id,
-                        name: profile.name,
-                        api_key: profile.api_key,
-                        base_url: profile.base_url,
-                    })
-                    .collect(),
+                    profiles: profiles
+                        .into_iter()
+                        .map(|profile| Profile {
+                            id: profile.id,
+                            name: profile.name,
+                            api_key: profile.api_key,
+                            base_url: profile.base_url,
+                        })
+                        .collect(),
+                }],
             })
         }
     }
@@ -164,11 +209,20 @@ fn parse_data(content: &str) -> Result<StoredData, String> {
 fn load_data_file() -> Result<StoredData, String> {
     let path = profiles_path()?;
     if !path.exists() {
-        return Ok(default_data());
+        let data = default_data();
+        save_data_file(&data)?;
+        return Ok(data);
     }
     let content =
         fs::read_to_string(&path).map_err(|error| format!("读取配置列表失败：{error}"))?;
-    parse_data(&content).map_err(|error| format!("解析配置列表失败：{error}"))
+    let data = parse_data(&content).map_err(|error| format!("解析配置列表失败：{error}"))?;
+    let source_version = serde_json::from_str::<JsonValue>(&content)
+        .ok()
+        .and_then(|value| value.get("version").and_then(JsonValue::as_u64));
+    if source_version != Some(DATA_VERSION as u64) {
+        save_data_file(&data)?;
+    }
+    Ok(data)
 }
 
 fn save_data_file(data: &StoredData) -> Result<(), String> {
@@ -241,6 +295,62 @@ fn merge_profiles(mut existing: Vec<Profile>, imported: Vec<Profile>) -> Vec<Pro
         }
     }
     existing
+}
+
+fn merge_applications(
+    mut existing: Vec<ApplicationConfig>,
+    imported: Vec<ApplicationConfig>,
+    import_directories: bool,
+) -> Vec<ApplicationConfig> {
+    for mut application in imported {
+        if let Some(saved) = existing.iter_mut().find(|saved| saved.id == application.id) {
+            saved.name = application.name;
+            saved.kind = application.kind;
+            if import_directories {
+                saved.directory = application.directory;
+            }
+            saved.profiles = merge_profiles(
+                std::mem::take(&mut saved.profiles),
+                std::mem::take(&mut application.profiles),
+            );
+        } else {
+            if !import_directories {
+                application.directory.clear();
+            }
+            existing.push(application);
+        }
+    }
+    existing
+}
+
+fn validate_application(application: &ApplicationConfig) -> Result<(), String> {
+    if application.name.trim().is_empty() {
+        return Err("请输入应用名称".to_string());
+    }
+    if application.kind != CODEX_KIND {
+        return Err(format!("暂不支持应用类型：{}", application.kind));
+    }
+    validate_directory(&application.directory)
+}
+
+fn application_mut<'a>(
+    data: &'a mut StoredData,
+    application_id: &str,
+) -> Result<&'a mut ApplicationConfig, String> {
+    data.applications
+        .iter_mut()
+        .find(|application| application.id == application_id)
+        .ok_or_else(|| "应用不存在".to_string())
+}
+
+fn application<'a>(
+    data: &'a StoredData,
+    application_id: &str,
+) -> Result<&'a ApplicationConfig, String> {
+    data.applications
+        .iter()
+        .find(|application| application.id == application_id)
+        .ok_or_else(|| "应用不存在".to_string())
 }
 
 fn updated_auth(content: &str, api_key: &str) -> Result<String, String> {
@@ -322,19 +432,33 @@ fn apply_values(directory: &Path, api_key: &str, base_url: &str) -> Result<(), S
 }
 
 fn state_from(data: StoredData) -> AppState {
-    let active_id =
-        current_values(&data.application.directory)
-            .ok()
-            .and_then(|(api_key, base_url)| {
-                data.profiles
-                    .iter()
-                    .find(|profile| profile.api_key == api_key && profile.base_url == base_url)
-                    .map(|profile| profile.id.clone())
-            });
     AppState {
-        directory: data.application.directory,
-        profiles: data.profiles,
-        active_id,
+        applications: data
+            .applications
+            .into_iter()
+            .map(|application| {
+                let active_id =
+                    current_values(&application.directory)
+                        .ok()
+                        .and_then(|(api_key, base_url)| {
+                            application
+                                .profiles
+                                .iter()
+                                .find(|profile| {
+                                    profile.api_key == api_key && profile.base_url == base_url
+                                })
+                                .map(|profile| profile.id.clone())
+                        });
+                ApplicationState {
+                    id: application.id,
+                    name: application.name,
+                    kind: application.kind,
+                    directory: application.directory,
+                    profiles: application.profiles,
+                    active_id,
+                }
+            })
+            .collect(),
     }
 }
 
@@ -344,23 +468,64 @@ fn get_state() -> Result<AppState, String> {
 }
 
 #[tauri::command]
-fn save_application(directory: String) -> Result<AppState, String> {
-    let directory = directory.trim().to_string();
-    validate_directory(&directory)?;
+fn save_application(
+    id: String,
+    name: String,
+    kind: String,
+    directory: String,
+) -> Result<AppState, String> {
     let mut data = load_data_file()?;
-    data.application.directory = directory;
+    let application = ApplicationConfig {
+        id: if id.is_empty() {
+            Uuid::new_v4().to_string()
+        } else {
+            id
+        },
+        name: name.trim().to_string(),
+        kind,
+        directory: directory.trim().to_string(),
+        profiles: Vec::new(),
+    };
+    validate_application(&application)?;
+    if let Some(saved) = data
+        .applications
+        .iter_mut()
+        .find(|saved| saved.id == application.id)
+    {
+        saved.name = application.name;
+        saved.kind = application.kind;
+        saved.directory = application.directory;
+    } else {
+        data.applications.push(application);
+    }
     save_data_file(&data)?;
     Ok(state_from(data))
 }
 
 #[tauri::command]
-fn save_profile(mut profile: Profile) -> Result<AppState, String> {
+fn delete_application(id: String) -> Result<AppState, String> {
     let mut data = load_data_file()?;
-    validate_directory(&data.application.directory)?;
+    if data.applications.len() == 1 {
+        return Err("至少保留一个应用".to_string());
+    }
+    let old_len = data.applications.len();
+    data.applications.retain(|application| application.id != id);
+    if data.applications.len() == old_len {
+        return Err("要删除的应用不存在".to_string());
+    }
+    save_data_file(&data)?;
+    Ok(state_from(data))
+}
+
+#[tauri::command]
+fn save_profile(application_id: String, mut profile: Profile) -> Result<AppState, String> {
+    let mut data = load_data_file()?;
+    let application = application_mut(&mut data, &application_id)?;
+    validate_application(application)?;
     if profile.id.is_empty() {
         profile = normalize_profile(profile)?;
-        data.profiles.push(profile);
-    } else if let Some(saved) = data
+        application.profiles.push(profile);
+    } else if let Some(saved) = application
         .profiles
         .iter_mut()
         .find(|saved| saved.id == profile.id)
@@ -375,11 +540,12 @@ fn save_profile(mut profile: Profile) -> Result<AppState, String> {
 }
 
 #[tauri::command]
-fn delete_profile(id: String) -> Result<AppState, String> {
+fn delete_profile(application_id: String, id: String) -> Result<AppState, String> {
     let mut data = load_data_file()?;
-    let old_len = data.profiles.len();
-    data.profiles.retain(|profile| profile.id != id);
-    if data.profiles.len() == old_len {
+    let application = application_mut(&mut data, &application_id)?;
+    let old_len = application.profiles.len();
+    application.profiles.retain(|profile| profile.id != id);
+    if application.profiles.len() == old_len {
         return Err("要删除的配置不存在".to_string());
     }
     save_data_file(&data)?;
@@ -387,10 +553,11 @@ fn delete_profile(id: String) -> Result<AppState, String> {
 }
 
 #[tauri::command]
-fn apply_profile(id: String) -> Result<AppState, String> {
+fn apply_profile(application_id: String, id: String) -> Result<AppState, String> {
     let data = load_data_file()?;
-    validate_directory(&data.application.directory)?;
-    let profile = data
+    let application = application(&data, &application_id)?;
+    validate_application(application)?;
+    let profile = application
         .profiles
         .iter()
         .find(|profile| profile.id == id)
@@ -398,7 +565,7 @@ fn apply_profile(id: String) -> Result<AppState, String> {
     validate_profile(profile)?;
 
     apply_values(
-        Path::new(&data.application.directory),
+        Path::new(&application.directory),
         &profile.api_key,
         &profile.base_url,
     )?;
@@ -410,35 +577,52 @@ fn preview_import(path: String) -> Result<ImportPreview, String> {
     let content =
         fs::read_to_string(&path).map_err(|error| format!("读取导入文件失败：{error}"))?;
     let imported = parse_data(&content).map_err(|error| format!("导入文件格式错误：{error}"))?;
-    if imported.profiles.is_empty() {
+    if imported.applications.is_empty() {
         return Err("导入文件中没有配置".to_string());
     }
     Ok(ImportPreview {
-        directory: Some(imported.application.directory),
-        profile_count: imported.profiles.len(),
+        application_count: imported.applications.len(),
+        profile_count: imported
+            .applications
+            .iter()
+            .map(|application| application.profiles.len())
+            .sum(),
+        has_existing_directories: imported
+            .applications
+            .iter()
+            .any(|application| !application.directory.trim().is_empty()),
     })
 }
 
 #[tauri::command]
-fn import_profiles(path: String, import_directory: bool) -> Result<AppState, String> {
+fn import_profiles(path: String, import_directories: bool) -> Result<AppState, String> {
     let content =
         fs::read_to_string(&path).map_err(|error| format!("读取导入文件失败：{error}"))?;
     let imported = parse_data(&content).map_err(|error| format!("导入文件格式错误：{error}"))?;
-    if imported.profiles.is_empty() {
+    if imported.applications.is_empty() {
         return Err("导入文件中没有配置".to_string());
     }
-    let profiles = imported
-        .profiles
-        .into_iter()
-        .map(normalize_profile)
-        .collect::<Result<Vec<_>, _>>()?;
-    let mut data = load_data_file()?;
-    if import_directory {
-        let directory = imported.application.directory.trim().to_string();
-        validate_directory(&directory)?;
-        data.application.directory = directory;
+    let mut imported_applications = imported.applications;
+    for application in &mut imported_applications {
+        application.id = application.id.trim().to_string();
+        if application.id.is_empty() {
+            application.id = Uuid::new_v4().to_string();
+        }
+        application.name = application.name.trim().to_string();
+        if application.name.is_empty() || application.kind != CODEX_KIND {
+            return Err("导入文件包含无效的应用".to_string());
+        }
+        application.profiles = std::mem::take(&mut application.profiles)
+            .into_iter()
+            .map(normalize_profile)
+            .collect::<Result<Vec<_>, _>>()?;
+        if import_directories {
+            validate_directory(&application.directory)?;
+        }
     }
-    data.profiles = merge_profiles(data.profiles, profiles);
+    let mut data = load_data_file()?;
+    data.applications =
+        merge_applications(data.applications, imported_applications, import_directories);
     save_data_file(&data)?;
     Ok(state_from(data))
 }
@@ -524,6 +708,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_state,
             save_application,
+            delete_application,
             save_profile,
             delete_profile,
             apply_profile,
@@ -539,10 +724,12 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_values, current_values, merge_profiles, parse_data, updated_auth, updated_config,
-        Profile, DATA_VERSION,
+        apply_values, current_values, merge_applications, merge_profiles, parse_data, updated_auth,
+        updated_config, ApplicationConfig, Profile, DATA_VERSION,
     };
-    use std::fs;
+    use std::{env, fs, sync::Mutex};
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn updates_only_requested_values() {
@@ -611,6 +798,55 @@ mod tests {
     }
 
     #[test]
+    fn merges_application_instances_and_preserves_local_directory() {
+        let application =
+            |id: &str, name: &str, directory: &str, profile_id: &str| ApplicationConfig {
+                id: id.to_string(),
+                name: name.to_string(),
+                kind: "codex".to_string(),
+                directory: directory.to_string(),
+                profiles: vec![Profile {
+                    id: profile_id.to_string(),
+                    name: profile_id.to_string(),
+                    api_key: "key".to_string(),
+                    base_url: "https://example.com".to_string(),
+                }],
+            };
+        let merged = merge_applications(
+            vec![application("same", "Local", "C:\\local", "local")],
+            vec![
+                application("same", "Imported", "C:\\imported", "imported"),
+                application("new", "New", "C:\\new", "new-profile"),
+            ],
+            false,
+        );
+
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].name, "Imported");
+        assert_eq!(merged[0].directory, "C:\\local");
+        assert_eq!(merged[0].profiles.len(), 2);
+        assert!(merged[1].directory.is_empty());
+    }
+
+    #[test]
+    fn imported_directory_can_replace_local_directory() {
+        let existing = ApplicationConfig {
+            id: "same".to_string(),
+            name: "Local".to_string(),
+            kind: "codex".to_string(),
+            directory: "C:\\local".to_string(),
+            profiles: Vec::new(),
+        };
+        let imported = ApplicationConfig {
+            directory: "C:\\imported".to_string(),
+            ..existing.clone()
+        };
+
+        let merged = merge_applications(vec![existing], vec![imported], true);
+        assert_eq!(merged[0].directory, "C:\\imported");
+    }
+
+    #[test]
     fn migrates_legacy_profile_array() {
         let data = parse_data(
             r#"[{
@@ -624,9 +860,81 @@ mod tests {
         .unwrap();
 
         assert_eq!(data.version, DATA_VERSION);
-        assert_eq!(data.application.directory, r"C:\Users\Admin\.codex");
-        assert_eq!(data.profiles.len(), 1);
-        assert_eq!(data.profiles[0].name, "First");
+        assert_eq!(data.applications[0].directory, r"C:\Users\Admin\.codex");
+        assert_eq!(data.applications[0].profiles.len(), 1);
+        assert_eq!(data.applications[0].profiles[0].name, "First");
+    }
+
+    #[test]
+    fn migrates_v2_application_data() {
+        let data = parse_data(
+            r#"{
+              "version": 2,
+              "application": {"id":"codex","directory":"C:\\Users\\Admin\\.codex"},
+              "profiles": [{"id":"one","name":"One","apiKey":"key","baseUrl":"https://example.com"}]
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(data.version, DATA_VERSION);
+        assert_eq!(data.applications[0].kind, "codex");
+        assert_eq!(data.applications[0].profiles.len(), 1);
+    }
+
+    #[test]
+    fn repeated_v2_import_merges_same_compatibility_application() {
+        let content = r#"{
+          "version": 2,
+          "application": {"id":"codex","directory":"C:\\Users\\Admin\\.codex"},
+          "profiles": [{"id":"one","name":"One","apiKey":"key","baseUrl":"https://example.com"}]
+        }"#;
+        let first = parse_data(content).unwrap().applications;
+        let second = parse_data(content).unwrap().applications;
+        let merged = merge_applications(first, second, false);
+
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].profiles.len(), 1);
+    }
+
+    #[test]
+    fn current_v3_application_id_is_stable() {
+        let content = r#"{
+          "version": 3,
+          "applications": [{
+            "id":"stable-id",
+            "name":"Codex",
+            "kind":"codex",
+            "directory":"C:\\Users\\Admin\\.codex",
+            "profiles":[]
+          }]
+        }"#;
+
+        assert_eq!(parse_data(content).unwrap().applications[0].id, "stable-id");
+        assert_eq!(parse_data(content).unwrap().applications[0].id, "stable-id");
+    }
+
+    #[test]
+    fn fresh_install_persists_application_id() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_app_data = env::var_os("APPDATA");
+        let app_data = env::temp_dir().join(format!(
+            "codex-key-manager-appdata-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        env::set_var("APPDATA", &app_data);
+
+        let first = super::load_data_file().unwrap();
+        let second = super::load_data_file().unwrap();
+        assert_eq!(first.applications[0].id, second.applications[0].id);
+        assert!(super::profiles_path().unwrap().is_file());
+
+        if let Some(value) = old_app_data {
+            env::set_var("APPDATA", value);
+        } else {
+            env::remove_var("APPDATA");
+        }
+        fs::remove_dir_all(app_data).unwrap();
     }
 
     #[test]
@@ -655,7 +963,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(data.application.directory, r"C:\Users\Admin\.codex");
-        assert_eq!(data.profiles.len(), 2);
+        assert_eq!(data.applications[0].directory, r"C:\Users\Admin\.codex");
+        assert_eq!(data.applications[0].profiles.len(), 2);
     }
 }
