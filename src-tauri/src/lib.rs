@@ -4,6 +4,11 @@ use std::{
     fs,
     path::{Path, PathBuf},
 };
+use tauri::{
+    menu::{Menu, MenuItem},
+    tray::{MouseButton, TrayIconBuilder, TrayIconEvent},
+    Manager,
+};
 use toml_edit::{value, DocumentMut};
 use uuid::Uuid;
 
@@ -229,13 +234,55 @@ fn exit_app(app: tauri::AppHandle) {
     app.exit(0);
 }
 
+fn show_main_window(app: &tauri::AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .setup(|app| {
+            let open = MenuItem::with_id(app, "open", "打开", true, None::<&str>)?;
+            let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
+            let menu = Menu::with_items(app, &[&open, &quit])?;
+            let icon = app.default_window_icon().cloned().ok_or("应用图标缺失")?;
+
+            if let Some(window) = app.get_webview_window("main") {
+                window.set_icon(icon.clone())?;
+            }
+
+            TrayIconBuilder::with_id("main-tray")
+                .icon(icon)
+                .tooltip("Codex Key Manager")
+                .menu(&menu)
+                .show_menu_on_left_click(false)
+                .on_menu_event(|app, event| match event.id().as_ref() {
+                    "open" => show_main_window(app),
+                    "quit" => app.exit(0),
+                    _ => {}
+                })
+                .on_tray_icon_event(|tray, event| {
+                    if matches!(
+                        event,
+                        TrayIconEvent::DoubleClick {
+                            button: MouseButton::Left,
+                            ..
+                        }
+                    ) {
+                        show_main_window(tray.app_handle());
+                    }
+                })
+                .build(app)?;
+            Ok(())
+        })
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
-                let _ = window.minimize();
+                let _ = window.hide();
             }
         })
         .invoke_handler(tauri::generate_handler![

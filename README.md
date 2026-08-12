@@ -9,6 +9,8 @@ Windows 桌面工具，用于保存并快速切换多组 Codex API 配置。
 
 配置保存在当前用户的 `%APPDATA%\codex-key-manager\profiles.json`。API Key 为明文，与 Codex 的 `auth.json` 存储方式一致。
 
+关闭窗口后应用隐藏到 Windows 系统托盘。双击托盘图标可恢复窗口，右键菜单可打开或退出。
+
 ## 开发
 
 ```powershell
