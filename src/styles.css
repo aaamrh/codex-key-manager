@@ -25,6 +25,8 @@ aside { padding: 22px; background: #f7f8f9; border-right: 1px solid #dfe2e4; }
 .profile-list { display: grid; gap: 10px; max-height: 430px; overflow: auto; padding-right: 2px; }
 .empty { padding: 32px 0; color: #777e86; font-size: 14px; text-align: center; }
 .profile { padding: 15px; border: 1px solid #d9dde0; border-radius: 6px; background: #fff; }
+.profile:hover { border-color: #9ca5ab; }
+.profile.selected { outline: 2px solid rgba(36, 113, 85, .2); outline-offset: -2px; }
 .profile.active { border-color: #2d7b5d; box-shadow: inset 3px 0 #2d7b5d; }
 .profile-title { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 9px; }
 .profile-title strong { overflow-wrap: anywhere; }

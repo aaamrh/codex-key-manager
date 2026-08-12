@@ -3,9 +3,9 @@ use serde_json::Value as JsonValue;
 use std::{
     fs,
     path::{Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH},
 };
 use toml_edit::{value, DocumentMut};
+use uuid::Uuid;
 
 const APP_DIR: &str = "codex-key-manager";
 const PROFILES_FILE: &str = "profiles.json";
@@ -184,11 +184,7 @@ fn save_profile(mut profile: Profile) -> Result<AppState, String> {
 
     let mut profiles = load_profiles_file()?;
     if profile.id.is_empty() {
-        profile.id = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|error| format!("系统时间错误：{error}"))?
-            .as_nanos()
-            .to_string();
+        profile.id = Uuid::new_v4().to_string();
         profiles.push(profile);
     } else if let Some(saved) = profiles.iter_mut().find(|saved| saved.id == profile.id) {
         *saved = profile;

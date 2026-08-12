@@ -43,6 +43,11 @@ function maskedKey(value: string): string {
   return value.length < 12 ? "********" : `${value.slice(0, 7)}********${value.slice(-4)}`;
 }
 
+function firstAvailableProfile(nextState: AppState): Profile | undefined {
+  return nextState.profiles.find((profile) => profile.id === nextState.activeId)
+    ?? nextState.profiles[0];
+}
+
 function render(): void {
   app.innerHTML = `
     <main class="shell">
@@ -56,7 +61,7 @@ function render(): void {
           <div class="profile-list">
             ${state.profiles.length === 0 ? '<p class="empty">还没有配置</p>' : ""}
             ${state.profiles.map((profile) => `
-              <article class="profile ${profile.id === state.activeId ? "active" : ""}">
+              <article class="profile ${profile.id === state.activeId ? "active" : ""} ${profile.id === editing.id ? "selected" : ""}" data-profile-id="${escapeAttribute(profile.id)}" tabindex="0">
                 <div class="profile-title">
                   <strong>${escapeHtml(profile.name)}</strong>
                   ${profile.id === state.activeId ? "<span>当前</span>" : ""}
@@ -121,12 +126,17 @@ function showToast(message: string, error = false): void {
   toastTimer = window.setTimeout(() => toast.className = "", 3000);
 }
 
-async function run(action: () => Promise<AppState>, success: string): Promise<void> {
+async function run(
+  action: () => Promise<AppState>,
+  success: string,
+  selectAfter: (nextState: AppState) => Profile | undefined,
+): Promise<void> {
   busy = true;
   render();
   try {
     state = await action();
-    editing = emptyProfile();
+    const selected = selectAfter(state) ?? firstAvailableProfile(state);
+    editing = selected ? { ...selected } : emptyProfile();
     busy = false;
     render();
     showToast(success);
@@ -153,11 +163,22 @@ function bindEvents(): void {
   document.querySelector("#profile-form")?.addEventListener("submit", (event) => {
     event.preventDefault();
     const profile = formProfile();
-    void run(() => invoke("save_profile", { profile }), "配置已保存");
+    void run(
+      () => invoke("save_profile", { profile }),
+      "配置已保存",
+      (nextState) => profile.id
+        ? nextState.profiles.find((item) => item.id === profile.id)
+        : nextState.profiles[nextState.profiles.length - 1],
+    );
   });
   document.querySelectorAll<HTMLButtonElement>(".apply").forEach((button) => {
     button.addEventListener("click", () => {
-      void run(() => invoke("apply_profile", { id: button.dataset.id }), "切换成功，重启 Codex 后生效");
+      const id = button.dataset.id!;
+      void run(
+        () => invoke("apply_profile", { id }),
+        "切换成功，重启 Codex 后生效",
+        (nextState) => nextState.profiles.find((profile) => profile.id === id),
+      );
     });
   });
   document.querySelectorAll<HTMLButtonElement>(".edit").forEach((button) => {
@@ -173,7 +194,29 @@ function bindEvents(): void {
     button.addEventListener("click", () => {
       const profile = state.profiles.find((item) => item.id === button.dataset.id);
       if (profile && window.confirm(`删除配置“${profile.name}”？`)) {
-        void run(() => invoke("delete_profile", { id: profile.id }), "配置已删除");
+        void run(
+          () => invoke("delete_profile", { id: profile.id }),
+          "配置已删除",
+          firstAvailableProfile,
+        );
+      }
+    });
+  });
+  document.querySelectorAll<HTMLElement>(".profile").forEach((card) => {
+    const selectCard = () => {
+      const profile = state.profiles.find((item) => item.id === card.dataset.profileId);
+      if (profile) {
+        editing = { ...profile };
+        render();
+      }
+    };
+    card.addEventListener("click", (event) => {
+      if (!(event.target as HTMLElement).closest("button")) selectCard();
+    });
+    card.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" || event.key === " ") {
+        event.preventDefault();
+        selectCard();
       }
     });
   });
@@ -183,6 +226,8 @@ async function start(): Promise<void> {
   render();
   try {
     state = await invoke("get_state");
+    const selected = firstAvailableProfile(state);
+    editing = selected ? { ...selected } : emptyProfile();
     render();
   } catch (error) {
     showToast(String(error), true);
