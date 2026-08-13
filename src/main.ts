@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import { open } from "@tauri-apps/plugin-dialog";
+import { confirm, open } from "@tauri-apps/plugin-dialog";
 import "./styles.css";
 
 type Profile = {
@@ -192,6 +192,18 @@ function showToast(message: string, error = false): void {
   toastTimer = window.setTimeout(() => toast.className = "", 3000);
 }
 
+async function confirmAction(
+  message: string,
+  options: Parameters<typeof confirm>[1],
+): Promise<boolean> {
+  try {
+    return await confirm(message, options);
+  } catch (error) {
+    showToast(String(error), true);
+    return false;
+  }
+}
+
 async function runState(action: () => Promise<AppState>, success: string, after?: () => void): Promise<boolean> {
   busy = true;
   render();
@@ -216,9 +228,18 @@ async function importData(): Promise<void> {
     const path = await open({ multiple: false, directory: false, filters: [{ name: "JSON 配置", extensions: ["json"] }] });
     if (!path) return;
     const preview = await invoke<ImportPreview>("preview_import", { path });
-    if (!window.confirm(`导入 ${preview.applicationCount} 个应用、${preview.profileCount} 个账号，继续？`)) return;
-    const importDirectories = preview.hasExistingDirectories
-      && window.confirm("是否同时导入配置目录？\n换电脑时建议选择“取消”，保留本机目录。");
+    const shouldImport = await confirmAction(
+      `导入 ${preview.applicationCount} 个应用、${preview.profileCount} 个账号，继续？`,
+      { title: "导入配置", kind: "warning", okLabel: "导入", cancelLabel: "取消" },
+    );
+    if (!shouldImport) return;
+    let importDirectories = false;
+    if (preview.hasExistingDirectories) {
+      importDirectories = await confirmAction(
+        "是否同时导入配置目录？\n换电脑时建议选择“取消”，保留本机目录。",
+        { title: "导入目录", kind: "warning", okLabel: "导入目录", cancelLabel: "保留本机目录" },
+      );
+    }
     await runState(
       () => invoke("import_profiles", { path, importDirectories }),
       "配置已导入",
@@ -230,7 +251,11 @@ async function importData(): Promise<void> {
 }
 
 async function exportData(): Promise<void> {
-  if (!window.confirm("完整备份包含配置目录和明文 API Key，继续？")) return;
+  const shouldExport = await confirmAction(
+    "完整备份包含配置目录和明文 API Key，继续？",
+    { title: "导出完整备份", kind: "warning", okLabel: "导出", cancelLabel: "取消" },
+  );
+  if (!shouldExport) return;
   busy = true;
   render();
   try {
@@ -288,9 +313,12 @@ function bindEvents(): void {
       },
     );
   });
-  document.querySelector("#delete-application")?.addEventListener("click", () => {
+  document.querySelector("#delete-application")?.addEventListener("click", async () => {
     const application = currentApplication();
-    if (application && window.confirm(`删除应用“${application.name}”及其全部账号？`)) {
+    if (application && await confirmAction(
+      `删除应用“${application.name}”及其全部账号？`,
+      { title: "删除应用", kind: "warning", okLabel: "删除", cancelLabel: "取消" },
+    )) {
       void runState(
         () => invoke("delete_application", { id: application.id }),
         "应用已删除",
@@ -354,10 +382,13 @@ function bindEvents(): void {
     });
   });
   document.querySelectorAll<HTMLButtonElement>(".delete").forEach((button) => {
-    button.addEventListener("click", () => {
+    button.addEventListener("click", async () => {
       const application = currentApplication();
       const profile = application?.profiles.find((item) => item.id === button.dataset.id);
-      if (application && profile && window.confirm(`删除账号“${profile.name}”？`)) {
+      if (application && profile && await confirmAction(
+        `删除账号“${profile.name}”？`,
+        { title: "删除账号", kind: "warning", okLabel: "删除", cancelLabel: "取消" },
+      )) {
         void runState(
           () => invoke("delete_profile", { applicationId: application.id, id: profile.id }),
           "账号已删除",
@@ -376,8 +407,8 @@ function bindEvents(): void {
   });
   document.querySelector("#import-data")?.addEventListener("click", () => void importData());
   document.querySelector("#export-data")?.addEventListener("click", () => void exportData());
-  document.querySelector("#exit-app")?.addEventListener("click", () => {
-    if (window.confirm("退出 Codex Key Manager？")) void invoke("exit_app");
+  document.querySelector("#exit-app")?.addEventListener("click", async () => {
+    if (await confirmAction("退出 Codex Key Manager？", "退出")) void invoke("exit_app");
   });
 }
 
